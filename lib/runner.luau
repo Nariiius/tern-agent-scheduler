@@ -260,6 +260,11 @@ end
 
 local close_block: (Run, (() -> ())?) -> ()
 
+local function cleanup_owned(blk: tern_state.Block): boolean
+	-- Moving a pane out of the configured runs workspace opts it out of automatic cleanup.
+	return blk.session == (jobs.settings().session_name or const.SESSION_NAME_DEFAULT)
+end
+
 local function maybe_close_after(run: Run)
 	local job = jobs.get(tostring(run.job_id))
 	if job == nil or run.block == nil or run.trigger == "test" then
@@ -287,7 +292,7 @@ local function maybe_close_after(run: Run)
 					return
 				end
 				local blk = st.blocks[tostring(run.block)]
-				if blk ~= nil and blk.focused ~= true and st.by_run[tostring(run.job_id) .. "/" .. tostring(run.run_id)] == blk then
+				if blk ~= nil and cleanup_owned(blk) and blk.focused ~= true and st.by_run[tostring(run.job_id) .. "/" .. tostring(run.run_id)] == blk then
 					close_block(run)
 				end
 			end)
@@ -562,13 +567,13 @@ function close_block(run: Run, cb: (() -> ())?)
 	end)
 end
 
--- EN §6.9: at most settings.max_finished_panes finished run panes stay open, oldest unfocused first.
+-- EN §6.9: cap finished panes still in the scheduler workspace, oldest unfocused first.
 local function enforce_cap(st: tern_state.State)
 	local limit = tonumber(jobs.settings().max_finished_panes) or const.MAX_FINISHED_PANES
 	local finished: { { block: any, run: Run? } } = {}
 	for key, blk in pairs(st.by_run) do
 		local run_id = key:match("/(r_[%w_]+)$")
-		if run_id ~= nil and S.runs[run_id] == nil then
+		if run_id ~= nil and S.runs[run_id] == nil and cleanup_owned(blk) then
 			table.insert(finished, { block = blk, run = ledger.get(run_id) })
 		end
 	end
