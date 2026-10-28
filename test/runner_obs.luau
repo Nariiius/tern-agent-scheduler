@@ -62,6 +62,25 @@ local function finished(run)
 	return ledger.get(run.run_id)
 end
 
+local wall_session = { id = 9001, name = "Agent Wall", shown = true, tabs = { { id = 9002, blocks = {} } } }
+table.insert(fake.sessions, wall_session)
+local function move_to_wall(run)
+	if not wall_session.tabs[1] then wall_session.tabs[1] = { id = 9002, blocks = {} } end
+	local id = tonumber(run.block)
+	for _, s in ipairs(fake.sessions) do
+		for _, tab in ipairs(s.tabs) do
+			for i, block in ipairs(tab.blocks) do
+				if block == id then
+					table.remove(tab.blocks, i)
+					table.insert(wall_session.tabs[1].blocks, id)
+					return
+				end
+			end
+		end
+	end
+	error("pane to move is missing")
+end
+
 local job = jobs.create({ name = "obs-job", prompt = "x", when = "manual", cwd = "/home/u/proj" }, "do it", "user", os.time())
 
 -- 1. waiting_input held >= 10 s => needs_input, one OS notification, none for the return to working
@@ -140,6 +159,7 @@ print("PASS RESULT: FAILED => failed/agent_failed")
 -- 6. the host deadline: omp does not exit at --max-time, so max_runtime + grace closes the run
 local slow = jobs.create({ name = "slow-job", prompt = "x", when = "manual", cwd = "/home/u/proj", max_runtime_s = 300 }, "slow", "user", os.time())
 local run6 = start_run(slow)
+move_to_wall(run6)
 local closes0 = #fake.calls_of("close")
 hold(run6.block, "working", "", 3)
 fake.advance(330000)
@@ -148,6 +168,7 @@ hold(run6.block, "working", "", 45)
 local rec6 = finished(run6)
 assert(rec6.state == "timed_out" and rec6.reason_code == "max_runtime", "timed_out: " .. tostring(rec6.state) .. "/" .. tostring(rec6.reason_code))
 assert(rec6.close_requested == true and #fake.calls_of("close") == closes0 + 1, "pane closed by the host")
+assert(fake.blocks[tonumber(run6.block)] == nil, "deadline still closes a moved running pane")
 print("PASS host deadline => timed_out/max_runtime, pane closed")
 
 -- 6b. a model call that failed right at the deadline is not a success. After a sleep, omp's own --max-time
@@ -183,10 +204,12 @@ print("PASS model error at the host deadline => timed_out/max_runtime")
 
 -- 7. stop
 local run7 = start_run(job)
+move_to_wall(run7)
 assert(runner.stop(run7.run_id) == true, "stop")
 fake.advance(1000)
 local rec7 = finished(run7)
 assert(rec7.state == "cancelled" and rec7.reason_code == "user_stop" and rec7.close_requested == true, "cancelled/user_stop")
+assert(fake.blocks[tonumber(run7.block)] == nil, "explicit stop still closes a moved pane")
 print("PASS stop => cancelled/user_stop")
 
 -- 8. the pane vanishing without our close => cancelled/closed_by_user
@@ -253,6 +276,52 @@ assert(run12.state == "running", "unknown finished value does not end the run")
 hold(run12.block, "idle", "RESULT: later", 9)
 assert(finished(run12).state == "finished", "idle hold still finishes it")
 print("PASS unknown finished value waits for the idle hold")
+
+-- 13. Delayed after-actions re-read placement, including moves made after the run finished.
+assert(jobs.set_settings({ max_finished_panes = 20 }))
+local function finish_now(r)
+	hold(r.block, "working", "", 3)
+	send_finished(r.block, "done", "RESULT: retained")
+	fake.advance(2500)
+	assert(finished(r).state == "finished", "run finished before cleanup")
+end
+for _, after in ipairs({ "close", "close_ok" }) do
+	local defaults = table.clone(jobs.settings().defaults)
+	defaults.after = after
+	assert(jobs.set_settings({ defaults = defaults }))
+	local closing = jobs.create({
+		name = "after-" .. after, prompt = "x", when = "manual", cwd = "/home/u/proj",
+	}, "do it", "user", os.time())
+	local moved = start_run(closing)
+	finish_now(moved)
+	move_to_wall(moved)
+	fake.advance(40000)
+	assert(fake.blocks[tonumber(moved.block)] ~= nil, after .. " keeps the moved completed pane")
+	assert(finished(moved).pane_closed_at == nil and finished(moved).close_requested ~= true, "moved pane not closed")
+	local owned = start_run(closing)
+	finish_now(owned)
+	fake.advance(40000)
+	assert(fake.blocks[tonumber(owned.block)] == nil, after .. " still closes the scheduler pane")
+	assert(finished(owned).pane_closed_at ~= nil, "automatic close recorded")
+end
+print("PASS close and close_ok protect moved finished panes but close scheduler panes")
+
+-- 14. Moved panes neither get pruned nor consume retention slots; honor the configured session name.
+assert(jobs.set_settings({ session_name = "Scheduled custom" }))
+local moved = start_run(job)
+finish_now(moved)
+move_to_wall(moved)
+local oldest = start_run(job)
+finish_now(oldest)
+local newest = start_run(job)
+finish_now(newest)
+assert(jobs.set_settings({ max_finished_panes = 1 }))
+runner.changed()
+fake.advance(40000)
+assert(fake.blocks[tonumber(moved.block)] ~= nil and finished(moved).pane_closed_at == nil, "cap keeps moved pane")
+assert(fake.blocks[tonumber(oldest.block)] == nil and finished(oldest).pane_closed_at ~= nil, "cap prunes oldest scheduler pane")
+assert(fake.blocks[tonumber(newest.block)] ~= nil and finished(newest).pane_closed_at == nil, "moved panes do not consume scheduler cap")
+print("PASS finished-pane cap protects moved panes and retains only the newest scheduler pane")
 
 assert(#fake.errors == 0, "no error logs: " .. table.concat(fake.errors, "; "))
 print("PASS no errors")
